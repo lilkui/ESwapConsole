@@ -6,6 +6,8 @@ public sealed class AppConfig
 {
     public string FrontAddress { get; init; } = null!;
 
+    public string DataFrontAddress { get; init; } = null!;
+
     public string BrokerId { get; init; } = null!;
 
     public UserProfile[] Users { get; init; } = [];

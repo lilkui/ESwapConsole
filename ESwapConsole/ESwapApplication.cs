@@ -133,7 +133,7 @@ public sealed class ESwapApplication(IOptions<AppConfig> options, ILogger<ESwapA
                 }
 
                 AnsiConsole.MarkupLine("[cyan]正在连接 ESwap 服务器...[/]");
-                await _api!.ConnectAsync(_config.FrontAddress).ConfigureAwait(false);
+                await _api!.ConnectAsync(_config.FrontAddress, _config.DataFrontAddress).ConfigureAwait(false);
                 AnsiConsole.MarkupLine("[green]已成功连接服务器。[/]");
 
                 AnsiConsole.MarkupLine("[cyan]正在认证...[/]");
