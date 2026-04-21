@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using ESwapConsole.Models;
 using ESwapConsole.Services;
 using ESwapSharp;
+using ESwapSharp.Interop;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Spectre.Console;
@@ -136,13 +137,8 @@ public sealed class ESwapApplication(IOptions<AppConfig> options, ILogger<ESwapA
                 await _api!.ConnectAsync(_config.FrontAddress, _config.DataFrontAddress).ConfigureAwait(false);
                 AnsiConsole.MarkupLine("[green]已成功连接服务器。[/]");
 
-                AnsiConsole.MarkupLine("[cyan]正在认证...[/]");
-                await _api.AuthenticateAsync().ConfigureAwait(false);
-                AnsiConsole.MarkupLine("[green]认证成功。[/]");
-
-                AnsiConsole.MarkupLine("[cyan]正在登录...[/]");
-                await _api.LoginAsync(_activeUser!.Password).ConfigureAwait(false);
-                AnsiConsole.MarkupLine("[green]登录成功。[/]");
+                await AuthenticateAndLoginAsync(ESWAP_TE_CONNECTION_TYPE.ESWAP_TECN_TRADE).ConfigureAwait(false);
+                await AuthenticateAndLoginAsync(ESWAP_TE_CONNECTION_TYPE.ESWAP_TECN_DATA).ConfigureAwait(false);
 
                 return true;
             }
@@ -163,6 +159,19 @@ public sealed class ESwapApplication(IOptions<AppConfig> options, ILogger<ESwapA
                 return false;
             }
         }
+    }
+
+    private async Task AuthenticateAndLoginAsync(ESWAP_TE_CONNECTION_TYPE connectionType)
+    {
+        string serverName = connectionType == ESWAP_TE_CONNECTION_TYPE.ESWAP_TECN_TRADE ? "交易" : "数据";
+
+        AnsiConsole.MarkupLine($"[cyan]正在认证{serverName}服务...[/]");
+        await _api!.AuthenticateAsync(connectionType).ConfigureAwait(false);
+        AnsiConsole.MarkupLine($"[green]{serverName}服务认证成功。[/]");
+
+        AnsiConsole.MarkupLine($"[cyan]正在登录{serverName}服务...[/]");
+        await _api.LoginAsync(_activeUser!.Password, connectionType).ConfigureAwait(false);
+        AnsiConsole.MarkupLine($"[green]{serverName}服务登录成功。[/]");
     }
 
     private void DisplayWelcomeHeader(string version)
