@@ -5,7 +5,7 @@ using Spectre.Console;
 
 namespace ESwapConsole.Services;
 
-public sealed class SblDemandMatcher
+public sealed class SblDemandMatcher : IDisposable
 {
     private readonly AppConfig _config;
     private readonly UserProfile _user;
@@ -19,18 +19,21 @@ public sealed class SblDemandMatcher
         _api.RtnSecuLendOrder += OnRtnSecuLendOrder;
     }
 
-    public async Task Match()
+    public async Task Match(CancellationToken cancellationToken = default)
     {
         await AnsiConsole.Status()
             .Start("[cyan]正在加载融券需求记录...[/]", async ctx =>
             {
                 try
                 {
-                    SblDemandRecord[] records = CsvHelper.ReadCsv<SblDemandRecord>(_config.SblDemandFilePath).ToArray();
+                    cancellationToken.ThrowIfCancellationRequested();
+                    SblDemandRecord[] records = CsvHelper.ReadCsv<SblDemandRecord>(_config.SblDemandFilePath);
                     foreach (SblDemandRecord record in records)
                     {
                         record.LockQuantity = 0;
                     }
+
+                    HashSet<int> managedAccounts = _user.AccountIds.ToHashSet();
 
                     Dictionary<int, Dictionary<string, SblDemandRecord>> recordsByAccountAndSymbol = records
                         .GroupBy(r => r.Account)
@@ -45,6 +48,7 @@ public sealed class SblDemandMatcher
 
                     foreach (int accountId in _user.AccountIds)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         ctx.Status = $"[cyan]正在处理账户 {accountId}...[/]";
 
                         List<CESwapSecuLendOrderField> orders = await _api.QrySecuLendOrderAsync(accountId);
@@ -73,6 +77,7 @@ public sealed class SblDemandMatcher
                                 // Cancel order
                                 if (order.VolumeTotal > 0)
                                 {
+                                    cancellationToken.ThrowIfCancellationRequested();
                                     await _api.SecuLendOrderActionAsync(accountId, order.OrderLocalID);
                                 }
                             }
@@ -95,7 +100,7 @@ public sealed class SblDemandMatcher
                         }
                     }
 
-                    foreach (SblDemandRecord record in records.Where(r => !_user.AccountIds.Contains(r.Account)))
+                    foreach (SblDemandRecord record in records.Where(r => !managedAccounts.Contains(r.Account)))
                     {
                         matchResults.Add(new MatchResult
                         {
@@ -116,18 +121,26 @@ public sealed class SblDemandMatcher
                             : StringComparer.OrdinalIgnoreCase.Compare(left.Symbol, right.Symbol);
                     });
 
-                    await Task.Delay(3000).ConfigureAwait(false);
-
+                    cancellationToken.ThrowIfCancellationRequested();
                     ctx.Status = "[cyan]正在写入结果文件...[/]";
                     CsvHelper.WriteCsv(records, _config.SblDemandFilePath);
 
                     DisplayMatchResults(matchResults);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    AnsiConsole.MarkupLine("[yellow]操作已取消。[/]");
                 }
                 catch (Exception ex)
                 {
                     AnsiConsole.MarkupLine($"[red]错误：[/]{ex.Message}");
                 }
             });
+    }
+
+    public void Dispose()
+    {
+        _api.RtnSecuLendOrder -= OnRtnSecuLendOrder;
     }
 
     private static void OnRtnSecuLendOrder(in CESwapSecuLendOrderField order)
@@ -201,7 +214,7 @@ public sealed class SblDemandMatcher
         AnsiConsole.Write(summary);
     }
 
-    private sealed class MatchResult
+    private sealed record MatchResult
     {
         public required int Account { get; init; }
         public required string Symbol { get; init; }

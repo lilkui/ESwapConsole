@@ -11,41 +11,46 @@ namespace ESwapConsole;
 
 public sealed class ESwapApplication(IOptions<AppConfig> options, ILogger<ESwapApi> apiLogger)
 {
+    private const int MaxConnectionRetries = 3;
+    private static readonly TimeSpan ConnectionRetryDelay = TimeSpan.FromSeconds(2);
+
     private readonly AppConfig _config = options.Value;
 
-    private ESwapApi? _api;
-    private UserProfile? _activeUser;
-    private SblDemandMatcher? _sblDemandMatcher;
-    private RecallManager? _recallManager;
-    private ReturnManager? _returnManager;
+    private SessionContext? _session;
 
-    public async Task RunAsync()
+    public async Task RunAsync(CancellationToken cancellationToken = default)
     {
         AnsiConsole.Clear();
-        DisplayWelcomeHeader(ESwapApi.GetApiVersion()!);
+        DisplayWelcomeHeader(ESwapApi.GetApiVersion() ?? "unknown");
 
-        while (true)
+        try
         {
-            UserProfile? user = PromptUserSelection();
-            if (user is null)
+            while (!cancellationToken.IsCancellationRequested)
             {
-                break;
-            }
+                UserProfile? user = PromptUserSelection();
+                if (user is null)
+                {
+                    break;
+                }
 
-            if (user != _activeUser && !await SwitchUserAsync(user).ConfigureAwait(false))
-            {
-                continue;
-            }
+                if (_session?.User != user && !await SwitchUserAsync(user, cancellationToken).ConfigureAwait(false))
+                {
+                    continue;
+                }
 
-            bool switchUser = await RunMenuLoop().ConfigureAwait(false);
-            if (!switchUser)
-            {
-                break;
+                SessionContext session = _session ?? throw new InvalidOperationException("活动会话尚未初始化。");
+                bool switchUser = await RunMenuLoopAsync(session, cancellationToken).ConfigureAwait(false);
+                if (!switchUser)
+                {
+                    break;
+                }
             }
         }
-
-        DisposeCurrentSession();
-        DisplayExitMessage();
+        finally
+        {
+            DisposeCurrentSession();
+            DisplayExitMessage();
+        }
     }
 
     private UserProfile? PromptUserSelection()
@@ -60,7 +65,7 @@ public sealed class ESwapApplication(IOptions<AppConfig> options, ILogger<ESwapA
 
         if (_config.Users.Length == 1)
         {
-            if (_activeUser is not null)
+            if (_session is not null)
             {
                 AnsiConsole.MarkupLine("[yellow]仅配置了一个用户，无法切换。[/]");
                 return null;
@@ -77,20 +82,16 @@ public sealed class ESwapApplication(IOptions<AppConfig> options, ILogger<ESwapA
         return _config.Users.First(u => u.UserId == selected);
     }
 
-    private async Task<bool> SwitchUserAsync(UserProfile user)
+    private async Task<bool> SwitchUserAsync(UserProfile user, CancellationToken cancellationToken)
     {
         DisposeCurrentSession();
 
-        _activeUser = user;
+        SessionContext session = CreateSession(user);
+        _session = session;
 
-        _api = new ESwapApi(_config.BrokerId, user.UserId, apiLogger, _config.RequestQpsLimit);
-        _sblDemandMatcher = new SblDemandMatcher(_config, user, _api);
-        _recallManager = new RecallManager(_config, _api);
-        _returnManager = new ReturnManager(_config, _api);
+        DisplayUserInfo(user);
 
-        DisplayUserInfo();
-
-        if (!await ConnectToApiAsync().ConfigureAwait(false))
+        if (!await ConnectToApiAsync(session, cancellationToken).ConfigureAwait(false))
         {
             DisposeCurrentSession();
             return false;
@@ -99,18 +100,21 @@ public sealed class ESwapApplication(IOptions<AppConfig> options, ILogger<ESwapA
         return true;
     }
 
+    private SessionContext CreateSession(UserProfile user)
+    {
+        ESwapApi api = new(_config.BrokerId, user.UserId, apiLogger, _config.RequestQpsLimit);
+        return new SessionContext(
+            user,
+            api,
+            new SblDemandMatcher(_config, user, api),
+            new RecallManager(_config, api),
+            new ReturnManager(_config, api));
+    }
+
     private void DisposeCurrentSession()
     {
-        _sblDemandMatcher = null;
-        _recallManager = null;
-        _returnManager = null;
-        _activeUser = null;
-
-        if (_api is not null)
-        {
-            _api.Dispose();
-            _api = null;
-        }
+        _session?.Dispose();
+        _session = null;
     }
 
     private static void DisplayError(string message)
@@ -118,40 +122,41 @@ public sealed class ESwapApplication(IOptions<AppConfig> options, ILogger<ESwapA
         AnsiConsole.MarkupLine($"[red]错误：[/]{message}");
     }
 
-    private async Task<bool> ConnectToApiAsync()
+    private async Task<bool> ConnectToApiAsync(SessionContext session, CancellationToken cancellationToken)
     {
-        const int maxRetries = 3;
-        int retryCount = 0;
-
-        while (true)
+        for (int retryCount = 0; retryCount < MaxConnectionRetries; retryCount++)
         {
             try
             {
                 if (retryCount > 0)
                 {
-                    AnsiConsole.MarkupLine($"[yellow]第 {retryCount} 次重试（共 {maxRetries - 1} 次）...[/]");
-                    await Task.Delay(2000).ConfigureAwait(false);
+                    AnsiConsole.MarkupLine($"[yellow]第 {retryCount} 次重试（共 {MaxConnectionRetries - 1} 次）...[/]");
+                    await Task.Delay(ConnectionRetryDelay, cancellationToken).ConfigureAwait(false);
                 }
 
+                cancellationToken.ThrowIfCancellationRequested();
                 AnsiConsole.MarkupLine("[cyan]正在连接 ESwap 服务器...[/]");
-                await _api!.ConnectAsync(_config.FrontAddress, _config.DataFrontAddress).ConfigureAwait(false);
+                await session.Api.ConnectAsync(_config.FrontAddress, _config.DataFrontAddress).ConfigureAwait(false);
                 AnsiConsole.MarkupLine("[green]已成功连接服务器。[/]");
 
-                await AuthenticateAndLoginAsync(ESWAP_TE_CONNECTION_TYPE.ESWAP_TECN_TRADE).ConfigureAwait(false);
-                await AuthenticateAndLoginAsync(ESWAP_TE_CONNECTION_TYPE.ESWAP_TECN_DATA).ConfigureAwait(false);
+                await AuthenticateAndLoginAsync(session, ESWAP_TE_CONNECTION_TYPE.ESWAP_TECN_TRADE, cancellationToken).ConfigureAwait(false);
+                await AuthenticateAndLoginAsync(session, ESWAP_TE_CONNECTION_TYPE.ESWAP_TECN_DATA, cancellationToken).ConfigureAwait(false);
 
                 return true;
             }
             catch (ExternalException ex)
             {
-                retryCount++;
                 DisplayError(ex.Message);
 
-                if (retryCount >= maxRetries)
+                if (retryCount == MaxConnectionRetries - 1)
                 {
-                    AnsiConsole.MarkupLine("[red]连接失败，已尝试 {0} 次。[/]", maxRetries);
+                    AnsiConsole.MarkupLine("[red]连接失败，已尝试 {0} 次。[/]", MaxConnectionRetries);
                     return false;
                 }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return false;
             }
             catch (Exception ex)
             {
@@ -159,18 +164,25 @@ public sealed class ESwapApplication(IOptions<AppConfig> options, ILogger<ESwapA
                 return false;
             }
         }
+
+        return false;
     }
 
-    private async Task AuthenticateAndLoginAsync(ESWAP_TE_CONNECTION_TYPE connectionType)
+    private async Task AuthenticateAndLoginAsync(
+        SessionContext session,
+        ESWAP_TE_CONNECTION_TYPE connectionType,
+        CancellationToken cancellationToken)
     {
         string serverName = connectionType == ESWAP_TE_CONNECTION_TYPE.ESWAP_TECN_TRADE ? "交易" : "数据";
 
+        cancellationToken.ThrowIfCancellationRequested();
         AnsiConsole.MarkupLine($"[cyan]正在认证{serverName}服务...[/]");
-        await _api!.AuthenticateAsync(connectionType).ConfigureAwait(false);
+        await session.Api.AuthenticateAsync(connectionType).ConfigureAwait(false);
         AnsiConsole.MarkupLine($"[green]{serverName}服务认证成功。[/]");
 
+        cancellationToken.ThrowIfCancellationRequested();
         AnsiConsole.MarkupLine($"[cyan]正在登录{serverName}服务...[/]");
-        await _api.LoginAsync(_activeUser!.Password, connectionType).ConfigureAwait(false);
+        await session.Api.LoginAsync(session.User.Password, connectionType).ConfigureAwait(false);
         AnsiConsole.MarkupLine($"[green]{serverName}服务登录成功。[/]");
     }
 
@@ -202,7 +214,7 @@ public sealed class ESwapApplication(IOptions<AppConfig> options, ILogger<ESwapA
         AnsiConsole.Write(versionTable);
     }
 
-    private void DisplayUserInfo()
+    private static void DisplayUserInfo(UserProfile user)
     {
         Table userTable = new Table()
             .AddColumn(new TableColumn("Property").LeftAligned())
@@ -210,17 +222,18 @@ public sealed class ESwapApplication(IOptions<AppConfig> options, ILogger<ESwapA
             .Border(TableBorder.Rounded)
             .BorderStyle(new Style(Color.Blue3));
 
-        userTable.AddRow("[cyan]用户编号[/]", $"[yellow]{_activeUser!.UserId}[/]");
-        userTable.AddRow("[cyan]账户列表[/]", $"[yellow]{string.Join(", ", _activeUser.AccountIds)}[/]");
+        userTable.AddRow("[cyan]用户编号[/]", $"[yellow]{user.UserId}[/]");
+        userTable.AddRow("[cyan]账户列表[/]", $"[yellow]{string.Join(", ", user.AccountIds)}[/]");
 
         AnsiConsole.Write(userTable);
     }
 
     /// <returns><see langword="true" /> 表示切换用户；<see langword="false" /> 表示退出。</returns>
-    private async Task<bool> RunMenuLoop()
+    private async Task<bool> RunMenuLoopAsync(SessionContext session, CancellationToken cancellationToken)
     {
         while (true)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             AnsiConsole.WriteLine();
             var panel = new Panel(
                 new Text("功能菜单", new Style(Color.White, decoration: Decoration.Bold))
@@ -277,15 +290,15 @@ public sealed class ESwapApplication(IOptions<AppConfig> options, ILogger<ESwapA
                 switch (input)
                 {
                     case "1":
-                        await _sblDemandMatcher!.Match().ConfigureAwait(false);
+                        await session.SblDemandMatcher.Match(cancellationToken).ConfigureAwait(false);
                         break;
 
                     case "2":
-                        await _recallManager!.RecallAsync().ConfigureAwait(false);
+                        await session.RecallManager.RecallAsync(cancellationToken).ConfigureAwait(false);
                         break;
 
                     case "3":
-                        await _returnManager!.ReturnAsync().ConfigureAwait(false);
+                        await session.ReturnManager.ReturnAsync(cancellationToken).ConfigureAwait(false);
                         break;
 
                     case "S":
@@ -310,5 +323,31 @@ public sealed class ESwapApplication(IOptions<AppConfig> options, ILogger<ESwapA
     {
         AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine("[yellow]程序已退出。[/]");
+    }
+
+    private sealed class SessionContext(
+        UserProfile user,
+        ESwapApi api,
+        SblDemandMatcher sblDemandMatcher,
+        RecallManager recallManager,
+        ReturnManager returnManager) : IDisposable
+    {
+        public UserProfile User { get; } = user;
+
+        public ESwapApi Api { get; } = api;
+
+        public SblDemandMatcher SblDemandMatcher { get; } = sblDemandMatcher;
+
+        public RecallManager RecallManager { get; } = recallManager;
+
+        public ReturnManager ReturnManager { get; } = returnManager;
+
+        public void Dispose()
+        {
+            SblDemandMatcher.Dispose();
+            RecallManager.Dispose();
+            ReturnManager.Dispose();
+            Api.Dispose();
+        }
     }
 }

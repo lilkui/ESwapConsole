@@ -22,7 +22,16 @@ builder.Services.AddSerilog((services, loggerConfiguration) => loggerConfigurati
         retainedFileCountLimit: 14,
         shared: true));
 
-builder.Services.Configure<AppConfig>(builder.Configuration.GetSection("AppConfig"));
+builder.Services
+    .AddOptions<AppConfig>()
+    .Bind(builder.Configuration.GetSection("AppConfig"))
+    .Validate(
+        static config => config.Users.All(static user =>
+            !string.IsNullOrWhiteSpace(user.UserId) &&
+            !string.IsNullOrWhiteSpace(user.Password) &&
+            user.AccountIds.Length > 0),
+        "Each user must configure UserId, Password, and at least one AccountId.")
+    .ValidateOnStart();
 
 builder.Services.AddSingleton<ESwapApplication>();
 
@@ -31,7 +40,8 @@ using IHost host = builder.Build();
 try
 {
     ESwapApplication app = host.Services.GetRequiredService<ESwapApplication>();
-    await app.RunAsync();
+    IHostApplicationLifetime lifetime = host.Services.GetRequiredService<IHostApplicationLifetime>();
+    await app.RunAsync(lifetime.ApplicationStopping);
 }
 finally
 {

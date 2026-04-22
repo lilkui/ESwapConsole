@@ -1,10 +1,15 @@
+using System.ComponentModel.DataAnnotations;
+
 namespace ESwapConsole.Models;
 
-public sealed class UserProfile
+public sealed record UserProfile
 {
-    public string UserId { get; init; } = null!;
+    [Required(AllowEmptyStrings = false)]
+    public string UserId { get; init; } = string.Empty;
 
-    public string Password { get; init; } = null!;
+    [Required(AllowEmptyStrings = false)]
+    public string Password { get; init; } = string.Empty;
 
+    [MinLength(1)]
     public int[] AccountIds { get; init; } = [];
 }

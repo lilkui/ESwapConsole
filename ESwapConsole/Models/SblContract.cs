@@ -8,7 +8,7 @@ public sealed class SblContract
     public int AccountId { get; set; }
 
     [Name("对手方合同编号")]
-    public string ContractId { get; set; } = null!;
+    public string ContractId { get; set; } = string.Empty;
 
     [Name("未归还")]
     public int Quantity { get; set; }

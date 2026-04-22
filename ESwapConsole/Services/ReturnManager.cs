@@ -7,8 +7,11 @@ using static ESwapSharp.Interop.NativeHelpers;
 
 namespace ESwapConsole.Services;
 
-public sealed class ReturnManager
+public sealed class ReturnManager : IDisposable
 {
+    private static readonly TimeSpan CallbackPollInterval = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan CallbackTimeout = TimeSpan.FromSeconds(10);
+
     private readonly AppConfig _config;
     private readonly ESwapApi _api;
     private readonly ConcurrentDictionary<long, ReturnResult> _resultsByOrderRef = new();
@@ -21,7 +24,7 @@ public sealed class ReturnManager
         _api.RtnContractOperation += OnRtnContractOperation;
     }
 
-    public async Task ReturnAsync()
+    public async Task ReturnAsync(CancellationToken cancellationToken = default)
     {
         try
         {
@@ -29,17 +32,16 @@ public sealed class ReturnManager
             _instructionNamesByOrderRef.Clear();
 
             AnsiConsole.MarkupLine("[cyan]正在加载合约...[/]");
-            ReturnContract[] contracts = CsvHelper.ReadCsv<ReturnContract>(_config.ReturnFilePath).ToArray();
+            ReturnContract[] contracts = CsvHelper.ReadCsv<ReturnContract>(_config.ReturnFilePath);
 
             AnsiConsole.MarkupLine("[cyan]正在处理还券指令...[/]");
             foreach (ReturnContract contract in contracts)
             {
-                await SubmitReturnInstructionAsync(contract, Constants.ESWAP_COTT_RETURN_YD_POSITION, contract.ReturnYesterdayQuantity).ConfigureAwait(false);
-                await SubmitReturnInstructionAsync(contract, Constants.ESWAP_COTT_RETURN_TD_POSITION, contract.ReturnTodayQuantity).ConfigureAwait(false);
+                await SubmitReturnInstructionAsync(contract, Constants.ESWAP_COTT_RETURN_YD_POSITION, contract.ReturnYesterdayQuantity, cancellationToken).ConfigureAwait(false);
+                await SubmitReturnInstructionAsync(contract, Constants.ESWAP_COTT_RETURN_TD_POSITION, contract.ReturnTodayQuantity, cancellationToken).ConfigureAwait(false);
             }
 
-            AnsiConsole.MarkupLine("[cyan]等待处理完成...[/]");
-            await Task.Delay(3000).ConfigureAwait(false);
+            await WaitForCallbacksAsync(cancellationToken).ConfigureAwait(false);
             DisplayReturnResults(contracts.Length);
         }
         catch (Exception ex)
@@ -48,7 +50,12 @@ public sealed class ReturnManager
         }
     }
 
-    private async Task SubmitReturnInstructionAsync(ReturnContract contract, sbyte instructionType, int quantity)
+    public void Dispose()
+    {
+        _api.RtnContractOperation -= OnRtnContractOperation;
+    }
+
+    private async Task SubmitReturnInstructionAsync(ReturnContract contract, sbyte instructionType, int quantity, CancellationToken cancellationToken)
     {
         if (quantity <= 0)
         {
@@ -59,6 +66,7 @@ public sealed class ReturnManager
 
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             long orderRef = await _api.ContractInstructionInsertAsync(contract.AccountId, contract.ContractId, instructionType, quantity).ConfigureAwait(false);
             _instructionNamesByOrderRef[orderRef] = instructionName;
         }
@@ -93,16 +101,46 @@ public sealed class ReturnManager
         };
 
         _resultsByOrderRef[orderRef] = result;
+        _instructionNamesByOrderRef.TryRemove(orderRef, out _);
 
         AnsiConsole.MarkupLine(
             $"委托编号：[bold yellow]{orderRef}[/]，合约ID：[cyan]{contractId}[/]，类型：[magenta]{instructionName}[/]，操作：[magenta]{(char)instruction.Operation}[/]，状态：[yellow]{status}[/]，还券数量：[green]{volume}[/]");
+    }
+
+    private async Task WaitForCallbacksAsync(CancellationToken cancellationToken)
+    {
+        if (_instructionNamesByOrderRef.IsEmpty)
+        {
+            return;
+        }
+
+        AnsiConsole.MarkupLine("[cyan]等待处理完成...[/]");
+
+        using CancellationTokenSource timeoutCancellation = new(CallbackTimeout);
+        using CancellationTokenSource linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            timeoutCancellation.Token);
+        using PeriodicTimer timer = new(CallbackPollInterval);
+
+        try
+        {
+            while (!_instructionNamesByOrderRef.IsEmpty && await timer.WaitForNextTickAsync(linkedCancellation.Token).ConfigureAwait(false))
+            {
+            }
+        }
+        catch (OperationCanceledException) when (timeoutCancellation.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            AnsiConsole.MarkupLine($"[yellow]部分回报在 {CallbackTimeout.TotalSeconds:0} 秒内未返回，当前仍有 {_instructionNamesByOrderRef.Count} 笔待确认。[/]");
+        }
     }
 
     private void DisplayReturnResults(int contractCount)
     {
         AnsiConsole.WriteLine();
 
-        ReturnResult[] results = _resultsByOrderRef.Values.ToArray();
+        ReturnResult[] results = _resultsByOrderRef.Values
+            .OrderBy(static result => result.OrderRef)
+            .ToArray();
 
         if (results.Length > 0)
         {
@@ -164,7 +202,7 @@ public sealed class ReturnManager
         }
     }
 
-    private sealed class ReturnResult
+    private sealed record ReturnResult
     {
         public required long OrderRef { get; init; }
         public required string ContractId { get; init; }

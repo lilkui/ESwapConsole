@@ -6,7 +6,7 @@ public sealed class SblDemandRecord
 {
     public int Account { get; set; }
 
-    public string Symbol { get; set; } = null!;
+    public string Symbol { get; set; } = string.Empty;
 
     public int DemandQuantity { get; set; }
 

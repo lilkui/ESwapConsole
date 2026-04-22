@@ -7,8 +7,11 @@ using static ESwapSharp.Interop.NativeHelpers;
 
 namespace ESwapConsole.Services;
 
-public sealed class RecallManager
+public sealed class RecallManager : IDisposable
 {
+    private static readonly TimeSpan CallbackPollInterval = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan CallbackTimeout = TimeSpan.FromSeconds(10);
+
     private readonly AppConfig _config;
     private readonly ESwapApi _api;
     private readonly ConcurrentDictionary<long, RecallResult> _resultsByOrderRef = new();
@@ -21,7 +24,7 @@ public sealed class RecallManager
         _api.RtnContractOperation += OnRtnContractOperation;
     }
 
-    public async Task RecallAsync()
+    public async Task RecallAsync(CancellationToken cancellationToken = default)
     {
         try
         {
@@ -29,7 +32,7 @@ public sealed class RecallManager
             _pendingOrderRefs.Clear();
 
             AnsiConsole.MarkupLine("[cyan]正在加载合约...[/]");
-            SblContract[] contracts = CsvHelper.ReadCsv<SblContract>(_config.RecallFilePath).ToArray();
+            SblContract[] contracts = CsvHelper.ReadCsv<SblContract>(_config.RecallFilePath);
 
             AnsiConsole.MarkupLine("[cyan]正在处理召回指令...[/]");
             foreach (SblContract contract in contracts)
@@ -45,14 +48,18 @@ public sealed class RecallManager
                 }
             }
 
-            AnsiConsole.MarkupLine("[cyan]等待处理完成...[/]");
-            await Task.Delay(3000).ConfigureAwait(false);
+            await WaitForCallbacksAsync(cancellationToken).ConfigureAwait(false);
             DisplayRecallResults();
         }
         catch (Exception ex)
         {
             AnsiConsole.MarkupLine($"[red]错误：[/]{ex.Message}");
         }
+    }
+
+    public void Dispose()
+    {
+        _api.RtnContractOperation -= OnRtnContractOperation;
     }
 
     private void OnRtnContractOperation(in CESwapContractOperationField instruction)
@@ -76,16 +83,46 @@ public sealed class RecallManager
         };
 
         _resultsByOrderRef[orderRef] = result;
+        _pendingOrderRefs.TryRemove(orderRef, out _);
 
         AnsiConsole.MarkupLine(
             $"委托编号：[bold yellow]{orderRef}[/]，合约ID：[cyan]{contractId}[/]，操作：[magenta]{(char)instruction.Operation}[/]，状态：[yellow]{status}[/]，召回数量：[green]{volume}[/]");
+    }
+
+    private async Task WaitForCallbacksAsync(CancellationToken cancellationToken)
+    {
+        if (_pendingOrderRefs.IsEmpty)
+        {
+            return;
+        }
+
+        AnsiConsole.MarkupLine("[cyan]等待处理完成...[/]");
+
+        using CancellationTokenSource timeoutCancellation = new(CallbackTimeout);
+        using CancellationTokenSource linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            timeoutCancellation.Token);
+        using PeriodicTimer timer = new(CallbackPollInterval);
+
+        try
+        {
+            while (!_pendingOrderRefs.IsEmpty && await timer.WaitForNextTickAsync(linkedCancellation.Token).ConfigureAwait(false))
+            {
+            }
+        }
+        catch (OperationCanceledException) when (timeoutCancellation.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            AnsiConsole.MarkupLine($"[yellow]部分回报在 {CallbackTimeout.TotalSeconds:0} 秒内未返回，当前仍有 {_pendingOrderRefs.Count} 笔待确认。[/]");
+        }
     }
 
     private void DisplayRecallResults()
     {
         AnsiConsole.WriteLine();
 
-        RecallResult[] results = _resultsByOrderRef.Values.ToArray();
+        RecallResult[] results = _resultsByOrderRef.Values
+            .OrderBy(static result => result.OrderRef)
+            .ToArray();
 
         if (results.Length > 0)
         {
@@ -145,7 +182,7 @@ public sealed class RecallManager
         }
     }
 
-    private sealed class RecallResult
+    private sealed record RecallResult
     {
         public required long OrderRef { get; init; }
         public required string ContractId { get; init; }

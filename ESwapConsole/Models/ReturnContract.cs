@@ -8,7 +8,7 @@ public sealed class ReturnContract
     public int AccountId { get; set; }
 
     [Name("合同编号")]
-    public string ContractId { get; set; } = null!;
+    public string ContractId { get; set; } = string.Empty;
 
     [Name("昨仓还券")]
     public int ReturnYesterdayQuantity { get; set; }
