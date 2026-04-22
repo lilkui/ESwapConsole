@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "skills": {
+    "csharp-concurrency-patterns": {
+      "source": "aaronontheweb/dotnet-skills",
+      "sourceType": "github",
+      "computedHash": "2ce0c63b105f13d60d5a4623da8316fe81a70eac1015e216d1d9978ac024e462"
+    },
+    "modern-csharp-coding-standards": {
+      "source": "aaronontheweb/dotnet-skills",
+      "sourceType": "github",
+      "computedHash": "38d6547db382a391ed740eef9d376f718639d27ecafe5bdedb981001b190acc9"
+    },
+    "type-design-performance": {
+      "source": "aaronontheweb/dotnet-skills",
+      "sourceType": "github",
+      "computedHash": "d34f1427d0a8663c37a6c6dd23a65e0ac905e787bc9680ab6df807c8d59c2292"
+    }
+  }
+}
