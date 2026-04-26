@@ -1,4 +1,5 @@
-﻿using ESwapConsole.Models;
+﻿using System.Collections.Concurrent;
+using ESwapConsole.Models;
 using ESwapSharp;
 using ESwapSharp.Interop;
 using Spectre.Console;
@@ -7,9 +8,13 @@ namespace ESwapConsole.Services;
 
 public sealed class SblDemandMatcher : IDisposable
 {
+    private static readonly TimeSpan CallbackPollInterval = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan CallbackTimeout = TimeSpan.FromSeconds(10);
+
     private readonly AppConfig _config;
     private readonly UserProfile _user;
     private readonly ESwapApi _api;
+    private readonly ConcurrentDictionary<long, byte> _pendingCancelOrderLocalIds = new();
 
     public SblDemandMatcher(AppConfig config, UserProfile user, ESwapApi api)
     {
@@ -26,6 +31,8 @@ public sealed class SblDemandMatcher : IDisposable
             {
                 try
                 {
+                    _pendingCancelOrderLocalIds.Clear();
+
                     cancellationToken.ThrowIfCancellationRequested();
                     SblDemandRecord[] records = CsvHelper.ReadCsv<SblDemandRecord>(_config.SblDemandFilePath);
                     foreach (SblDemandRecord record in records)
@@ -78,7 +85,18 @@ public sealed class SblDemandMatcher : IDisposable
                                 if (order.VolumeTotal > 0)
                                 {
                                     cancellationToken.ThrowIfCancellationRequested();
-                                    await _api.SecuLendOrderActionAsync(accountId, order.OrderLocalID);
+                                    long orderLocalId = order.OrderLocalID;
+                                    _pendingCancelOrderLocalIds[orderLocalId] = 0;
+
+                                    try
+                                    {
+                                        await _api.SecuLendOrderActionAsync(accountId, orderLocalId).ConfigureAwait(false);
+                                    }
+                                    catch
+                                    {
+                                        _pendingCancelOrderLocalIds.TryRemove(orderLocalId, out _);
+                                        throw;
+                                    }
                                 }
                             }
                         }
@@ -113,6 +131,8 @@ public sealed class SblDemandMatcher : IDisposable
                         });
                     }
 
+                    await WaitForCancelCallbacksAsync(cancellationToken).ConfigureAwait(false);
+
                     matchResults.Sort(static (left, right) =>
                     {
                         int accountCompare = left.Account.CompareTo(right.Account);
@@ -143,14 +163,44 @@ public sealed class SblDemandMatcher : IDisposable
         _api.RtnSecuLendOrder -= OnRtnSecuLendOrder;
     }
 
-    private static void OnRtnSecuLendOrder(in CESwapSecuLendOrderField order)
+    private void OnRtnSecuLendOrder(in CESwapSecuLendOrderField order)
     {
+        if (!Convert.ToBoolean(order.IsCancel))
+        {
+            return;
+        }
+
         string symbol = NativeHelpers.ReadString(order.InstrumentID);
         char status = Convert.ToChar(order.SecuLendOrderStatus);
 
-        if (Convert.ToBoolean(order.IsCancel))
+        AnsiConsole.MarkupLine($"[yellow]报单已撤销：[/]股票代码：[cyan]{symbol}[/]，状态：[yellow]{status}[/]");
+        _pendingCancelOrderLocalIds.TryRemove(order.OrderLocalID, out _);
+    }
+
+    private async Task WaitForCancelCallbacksAsync(CancellationToken cancellationToken)
+    {
+        if (_pendingCancelOrderLocalIds.IsEmpty)
         {
-            AnsiConsole.MarkupLine($"[yellow]报单已撤销：[/]股票代码：[cyan]{symbol}[/]，状态：[yellow]{status}[/]");
+            return;
+        }
+
+        AnsiConsole.MarkupLine("[cyan]等待撤单回报完成...[/]");
+
+        using CancellationTokenSource timeoutCancellation = new(CallbackTimeout);
+        using CancellationTokenSource linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            timeoutCancellation.Token);
+        using PeriodicTimer timer = new(CallbackPollInterval);
+
+        try
+        {
+            while (!_pendingCancelOrderLocalIds.IsEmpty && await timer.WaitForNextTickAsync(linkedCancellation.Token).ConfigureAwait(false))
+            {
+            }
+        }
+        catch (OperationCanceledException) when (timeoutCancellation.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            AnsiConsole.MarkupLine($"[yellow]部分撤单回报在 {CallbackTimeout.TotalSeconds:0} 秒内未返回，当前仍有 {_pendingCancelOrderLocalIds.Count} 笔待确认。[/]");
         }
     }
 
